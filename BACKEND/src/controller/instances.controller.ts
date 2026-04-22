@@ -18,11 +18,37 @@ function readAssignedNodePort(serviceResponse: unknown): number | undefined {
     return direct.spec?.ports?.[0]?.nodePort ?? wrapped.body?.spec?.ports?.[0]?.nodePort;
 }
 
+async function resolveEc2HostFromMetadata(): Promise<string | undefined> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+
+    try {
+        const response = await fetch("http://169.254.169.254/latest/meta-data/public-ipv4", {
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            return undefined;
+        }
+
+        const host = (await response.text()).trim();
+        return host || undefined;
+    } catch {
+        return undefined;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
 // Keep compatibility with local minikube, but allow explicit host override for EC2/public deployments.
-function getDatabaseHost(): string {
+async function getDatabaseHost(): Promise<string> {
     const fromEnv = process.env.DB_NODE_HOST?.trim();
     if (fromEnv) {
         return fromEnv;
+    }
+
+    const ec2Host = await resolveEc2HostFromMetadata();
+    if (ec2Host) {
+        return ec2Host;
     }
 
     return getMiniKubeIp();
@@ -114,7 +140,7 @@ export const createInstance = async (req: Request, res: Response) => {
             body: hpa(cfg),
         });
 
-        const databaseHost = getDatabaseHost();
+        const databaseHost = await getDatabaseHost();
         const connectionURL = `postgresql://${username}:${password}@${databaseHost}:${assignedNodePort}/${dbname}`;
 
         instances.set(id, {

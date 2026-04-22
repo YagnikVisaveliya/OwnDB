@@ -4,24 +4,28 @@ import { randomUUID } from "node:crypto";
 import { appsV1Api, autoscalingV2Api, coreV1Api } from "../config/client.js";
 import type { Request, Response } from "express";
 
-const instances = new Map<string, InstanceConfig & {
+type StoredInstance = Omit<InstanceConfig, "nodePort"> & {
+    nodePort: number;
     connectionURL: string;
-}>();
+};
 
-//pick free pods in the range of 30000-32767
+const instances = new Map<string, StoredInstance>();
 
-const usedPorts = new Set<number>();
+function readAssignedNodePort(serviceResponse: unknown): number | undefined {
+    const direct = serviceResponse as { spec?: { ports?: Array<{ nodePort?: number }> } };
+    const wrapped = serviceResponse as { body?: { spec?: { ports?: Array<{ nodePort?: number }> } } };
 
-function pickFreePort(): number {
-    for (let port = 30000; port <= 32767; port++) {
-        if (!usedPorts.has(port)) {
-            usedPorts.add(port);
-            console.log("Picked free port:", port);
-            return port;
-        }
+    return direct.spec?.ports?.[0]?.nodePort ?? wrapped.body?.spec?.ports?.[0]?.nodePort;
+}
+
+// Keep compatibility with local minikube, but allow explicit host override for EC2/public deployments.
+function getDatabaseHost(): string {
+    const fromEnv = process.env.DB_NODE_HOST?.trim();
+    if (fromEnv) {
+        return fromEnv;
     }
-    throw new Error("No free port available");
 
+    return getMiniKubeIp();
 }
 
 function getMiniKubeIp(): string {
@@ -57,8 +61,9 @@ export const createInstance = async (req: Request, res: Response) => {
         return res.status(400).json({ error: "minReplicas cannot be greater than maxReplicas" });
     }
 
-    const id=randomUUID().slice(0, 8);
-    const nodePort = pickFreePort();
+    const id = randomUUID().slice(0, 8);
+    const namespaceName = `db-${id}`;
+    let namespaceCreated = false;
 
     const cfg: InstanceConfig = {
         id,
@@ -71,57 +76,73 @@ export const createInstance = async (req: Request, res: Response) => {
         memLimit,
         minReplicas: Number(minReplicas),
         maxReplicas: Number(maxReplicas),
-        nodePort,
     };
 
     try {
         await coreV1Api.createNamespace({
             body: namespace(cfg),           
         });
+        namespaceCreated = true;
 
         await coreV1Api.createNamespacedSecret({
-            namespace: `db-${id}`,
+            namespace: namespaceName,
         body: secret(cfg),
         });
 
         await coreV1Api.createNamespacedPersistentVolumeClaim({
-            namespace: `db-${id}`,
+            namespace: namespaceName,
             body: pvc(cfg),
         });
 
         await appsV1Api.createNamespacedDeployment({
-            namespace: `db-${id}`,
+            namespace: namespaceName,
             body: deployment(cfg),
         });
 
-        await coreV1Api.createNamespacedService({
-            namespace: `db-${id}`,
+        const createdService = await coreV1Api.createNamespacedService({
+            namespace: namespaceName,
             body: service(cfg),
         });
 
+        const assignedNodePort = readAssignedNodePort(createdService);
+        if (typeof assignedNodePort !== "number") {
+            throw new Error("Kubernetes did not return an assigned NodePort");
+        }
+
         await autoscalingV2Api.createNamespacedHorizontalPodAutoscaler({
-            namespace: `db-${id}`,
+            namespace: namespaceName,
             body: hpa(cfg),
         });
 
-        const miniKubeIp = getMiniKubeIp();
-        const connectionURL = `postgresql://${username}:${password}@${miniKubeIp}:${nodePort}/${dbname}`;
+        const databaseHost = getDatabaseHost();
+        const connectionURL = `postgresql://${username}:${password}@${databaseHost}:${assignedNodePort}/${dbname}`;
 
         instances.set(id, {
             ...cfg,
+            nodePort: assignedNodePort,
             connectionURL,
         }); 
 
         return res.status(201).json({
             id,
             connectionURL,
-            namespace: `db-${id}`,
-            nodePort,
+            namespace: namespaceName,
+            nodePort: assignedNodePort,
             message: "Instance provisioning started. It may take a few moments for the instance to be ready.",
         });
 
     } catch (error) {
         console.error("Error creating instance:", error);
+
+        if (namespaceCreated) {
+            try {
+                await coreV1Api.deleteNamespace({ name: namespaceName });
+                console.log("Rolled back namespace after provisioning error:", namespaceName);
+            } catch (cleanupError) {
+                console.error("Failed to rollback namespace after provisioning error:", cleanupError);
+            }
+        }
+
         return res.status(500).json({ error: "Failed to create instance" });
     }
 
@@ -171,7 +192,6 @@ export const deleteInstance = async (req: Request, res: Response) => {
     }
     try {
         await coreV1Api.deleteNamespace({ name: `db-${id}` });
-        usedPorts.delete(inst.nodePort);
         instances.delete(id);
         return res.status(200).json({ message: "Instance deleted" });
     } catch (error) {

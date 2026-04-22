@@ -16,6 +16,7 @@ function pickFreePort(): number {
     for (let port = 30000; port <= 32767; port++) {
         if (!usedPorts.has(port)) {
             usedPorts.add(port);
+            console.log("Picked free port:", port);
             return port;
         }
     }

@@ -11,7 +11,7 @@ export interface InstanceConfig {
     memLimit: string;
     minReplicas: number;
     maxReplicas: number;
-    nodePort: number;
+    nodePort?: number;
 }
 
 export const namespace = (cfg: InstanceConfig) : k8s.V1Namespace => {
@@ -132,6 +132,15 @@ export const deployment = (cfg: InstanceConfig) : k8s.V1Deployment => {
 };
 
 export const service = (cfg: InstanceConfig) : k8s.V1Service => {
+    const servicePort: k8s.V1ServicePort = {
+        port: 5432,
+        targetPort: 5432 as unknown as k8s.IntOrString,
+    };
+
+    if (typeof cfg.nodePort === 'number') {
+        servicePort.nodePort = cfg.nodePort;
+    }
+
     return {
         apiVersion: 'v1',
         kind: 'Service',
@@ -144,11 +153,7 @@ export const service = (cfg: InstanceConfig) : k8s.V1Service => {
             selector: {
                 app: 'postgres',
             },
-            ports: [{
-                port: 5432,
-                targetPort: 5432 as unknown as k8s.IntOrString,
-                nodePort: cfg.nodePort,
-            }]
+            ports: [servicePort]
         }
     }
 }
